@@ -169,8 +169,8 @@ class TaskHeaderKeeper(object):
             min_price=0.0,
             app_version=APP_VERSION,
             remove_task_timeout=180,
-            verification_timeout=3600
-            ):
+            verification_timeout=3600,
+            max_tasks_per_requestor=10):
         # all computing tasks that this node knows about
         self.task_headers = {}
         # ids of tasks that this node may try to compute
@@ -178,12 +178,15 @@ class TaskHeaderKeeper(object):
         # tasks that were removed from network recently, so they won't
         # be added again to task_headers
         self.removed_tasks = {}
+        # task ids by owner
+        self.tasks_by_owner = {}
 
         self.min_price = min_price
         self.app_version = app_version
         self.verification_timeout = verification_timeout
         self.removed_task_timeout = remove_task_timeout
         self.environments_manager = environments_manager
+        self.max_tasks_per_requestor = max_tasks_per_requestor
 
     def is_supported(self, th_dict_repr):
         """Checks if task described with given task header dict
@@ -309,7 +312,14 @@ class TaskHeaderKeeper(object):
                 raise TypeError(err)
 
             if id_ not in list(self.removed_tasks.keys()):  # not recent
-                self.task_headers[id_] = TaskHeader.from_dict(th_dict_repr)
+                th = TaskHeader.from_dict(th_dict_repr)
+                self.task_headers[id_] = th
+
+                if th.task_owner_key_id not in self.tasks_by_owner:
+                    self.tasks_by_owner[th.task_owner_key_id] = set()
+                owner_task_set = self.tasks_by_owner[th.task_owner_key_id]
+                owner_task_set.add(id_)
+
                 is_supported = self.is_supported(th_dict_repr)
 
                 if update:
@@ -323,6 +333,19 @@ class TaskHeaderKeeper(object):
                     )
                     self.supported_tasks.append(id_)
 
+                if len(owner_task_set) > self.max_tasks_per_requestor:
+                    by_age = sorted(
+                        owner_task_set,
+                        key=lambda tid: self.task_headers[tid].last_checking)
+                    # leave alone the first (oldest) max_tasks_per_requestor
+                    # headers, remove the rest
+                    to_remove = by_age[self.max_tasks_per_requestor:]
+                    logger.warning("Too many tasks from %s, dropping %d",
+                                   th.task_owner_key_id, len(to_remove))
+
+                    for tid in to_remove:
+                        self.remove_task_header(tid)
+
             return True
         except (KeyError, TypeError) as err:
             logger.warning("Wrong task header received {}".format(err))
@@ -332,7 +355,10 @@ class TaskHeaderKeeper(object):
         """ Removes task with given id from a list of known task headers.
         """
         if task_id in self.task_headers:
+            owner_key_id = self.task_headers[task_id].task_owner_key_id
             del self.task_headers[task_id]
+            if owner_key_id in self.tasks_by_owner:
+                self.tasks_by_owner[owner_key_id].discard(task_id)
         if task_id in self.supported_tasks:
             self.supported_tasks.remove(task_id)
         self.removed_tasks[task_id] = time.time()
@@ -342,7 +368,7 @@ class TaskHeaderKeeper(object):
         :return TaskHeader|None: returns either None if there are no tasks
                                  that this node may want to compute
         """
-        if len(self.supported_tasks) > 0:
+        if self.supported_tasks:
             tn = random.randrange(0, len(self.supported_tasks))
             task_id = self.supported_tasks[tn]
             return self.task_headers[task_id]
